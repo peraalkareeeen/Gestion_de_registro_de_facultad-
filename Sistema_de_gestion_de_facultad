@@ -1,0 +1,533 @@
+import csv
+import hashlib
+import hmac
+import os
+
+# ===================== CONSTANTES =====================
+CARPETA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
+ARCHIVOS = {
+    "usuarios": ("usuarios.csv", ["dni", "nombre", "rol", "activo", "clave"]),
+    "materias": ("materias.csv", ["codigo", "nombre", "carrera", "docente", "cupo"]),
+    "inscripciones": ("inscripciones.csv", ["id", "alumno", "materia", "estado"]),
+}
+ROLES = ["ADMIN", "DOCENTE", "ALUMNO"]
+ESTADOS = ["Pendiente", "Aprobada", "Cancelada"]
+PERMISOS = {
+    "ADMIN": {"usuarios", "materias", "ver_todas", "reportes"},
+    "DOCENTE": {"calificar", "reportes"},
+    "ALUMNO": {"inscribirse", "cancelar"},
+}
+# En memoria: usuarios y materias en diccionarios (búsqueda por clave),
+# inscripciones en lista (orden e historial).
+BD = {"usuarios": {}, "materias": {}, "inscripciones": []}
+AVISOS = []
+
+
+class ErrorNegocio(Exception):
+    pass
+
+
+# ===================== SEGURIDAD =====================
+def hashear(clave):
+    sal = os.urandom(16)
+    return sal.hex() + "$" + hashlib.pbkdf2_hmac("sha256", clave.encode(), sal, 100_000).hex()
+
+
+def verificar(clave, guardado):
+    try:
+        sal, h = guardado.split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", clave.encode(), bytes.fromhex(sal), 100_000).hex()
+        return hmac.compare_digest(calc, h)
+    except ValueError:
+        return False
+
+
+def puede(usuario, permiso):
+    return permiso in PERMISOS.get(usuario["rol"], set())
+
+
+def requiere(usuario, permiso):
+    """Validación en la capa lógica (además de ocultar opciones en el menú)."""
+    if not puede(usuario, permiso):
+        raise PermissionError("No tenés permiso para realizar esta acción.")
+
+
+# ===================== ARCHIVOS =====================
+def leer(nombre):
+    archivo, campos = ARCHIVOS[nombre]
+    try:
+        with open(os.path.join(CARPETA, archivo), newline="", encoding="utf-8") as f:
+            return [r for r in csv.DictReader(f) if all(r.get(c) for c in campos)]
+    except FileNotFoundError:
+        return []
+    except (OSError, csv.Error, UnicodeDecodeError):
+        AVISOS.append(f"No se pudo leer {archivo}; se inició vacío.")
+        return []
+
+
+def guardar(*nombres):
+    """Escribe enseguida cada archivo modificado (archivo temporal + reemplazo)."""
+    try:
+        os.makedirs(CARPETA, exist_ok=True)
+        for nombre in nombres:
+            archivo, campos = ARCHIVOS[nombre]
+            if nombre == "usuarios":
+                filas = [{**u, "activo": "1" if u["activo"] else "0"} for u in BD["usuarios"].values()]
+            elif nombre == "materias":
+                filas = list(BD["materias"].values())
+            else:
+                filas = BD["inscripciones"]
+            ruta = os.path.join(CARPETA, archivo)
+            with open(ruta + ".tmp", "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=campos)
+                w.writeheader()
+                w.writerows(filas)
+            os.replace(ruta + ".tmp", ruta)
+    except OSError as e:
+        raise ErrorNegocio(f"No se pudo guardar en disco: {e}")
+
+
+def cargar():
+    BD["usuarios"] = {r["dni"]: {**r, "activo": r["activo"] == "1"} for r in leer("usuarios")}
+    BD["materias"], BD["inscripciones"] = {}, []
+    for r in leer("materias"):
+        try:
+            BD["materias"][r["codigo"]] = {**r, "cupo": int(r["cupo"])}
+        except ValueError:
+            AVISOS.append(f"Materia {r['codigo']} ignorada (cupo inválido).")
+    for r in leer("inscripciones"):
+        try:
+            BD["inscripciones"].append({**r, "id": int(r["id"])})
+        except ValueError:
+            AVISOS.append("Una inscripción con id inválido fue ignorada.")
+    if not admins_activos():
+        BD["usuarios"]["admin"] = {"dni": "admin", "nombre": "Administrador", "rol": "ADMIN",
+                                   "activo": True, "clave": hashear("admin123")}
+        try:
+            guardar("usuarios")
+        except ErrorNegocio as e:
+            AVISOS.append(str(e))
+
+
+# ===================== REGLAS DE NEGOCIO =====================
+def texto(valor, campo):
+    valor = (valor or "").strip()
+    if not valor:
+        raise ErrorNegocio(f"El campo '{campo}' no puede estar vacío.")
+    return valor
+
+
+def admins_activos():
+    return [u for u in BD["usuarios"].values() if u["rol"] == "ADMIN" and u["activo"]]
+
+
+def usuario_existente(dni):
+    if dni not in BD["usuarios"]:
+        raise ErrorNegocio("El usuario no existe.")
+    return BD["usuarios"][dni]
+
+
+def validar_no_perder_admin(actor, u):
+    if u["dni"] == actor["dni"]:
+        raise ErrorNegocio("No podés eliminarte ni desactivarte a vos mismo.")
+    if u["rol"] == "ADMIN" and u["activo"] and len(admins_activos()) <= 1:
+        raise ErrorNegocio("Debe quedar al menos un administrador activo.")
+
+
+def login(dni, clave):
+    u = BD["usuarios"].get((dni or "").strip())
+    if not u or not verificar(clave or "", u["clave"]):
+        raise ErrorNegocio("DNI o contraseña incorrectos.")
+    if not u["activo"]:
+        raise ErrorNegocio("El usuario está desactivado.")
+    return u
+
+
+def alta_usuario(actor, dni, nombre, rol, clave):
+    requiere(actor, "usuarios")
+    dni, nombre, clave = texto(dni, "DNI"), texto(nombre, "Nombre"), texto(clave, "Clave")
+    if rol not in ROLES:
+        raise ErrorNegocio("Elegí un rol válido.")
+    if len(clave) < 4:
+        raise ErrorNegocio("La clave debe tener al menos 4 caracteres.")
+    if dni in BD["usuarios"]:
+        raise ErrorNegocio("Ya existe un usuario con ese DNI.")
+    BD["usuarios"][dni] = {"dni": dni, "nombre": nombre, "rol": rol, "activo": True, "clave": hashear(clave)}
+    guardar("usuarios")
+
+
+def alternar_usuario(actor, dni):
+    requiere(actor, "usuarios")
+    u = usuario_existente(dni)
+    if u["activo"]:
+        validar_no_perder_admin(actor, u)
+    u["activo"] = not u["activo"]
+    guardar("usuarios")
+
+
+def baja_usuario(actor, dni):
+    requiere(actor, "usuarios")
+    u = usuario_existente(dni)
+    validar_no_perder_admin(actor, u)
+    if any(m["docente"] == dni for m in BD["materias"].values()):
+        raise ErrorNegocio("Ese docente tiene materias: eliminalas o reasignalas antes.")
+    del BD["usuarios"][dni]
+    BD["inscripciones"][:] = [i for i in BD["inscripciones"] if i["alumno"] != dni]
+    guardar("usuarios", "inscripciones")
+
+
+def alta_materia(actor, codigo, nombre, carrera, docente, cupo):
+    requiere(actor, "materias")
+    codigo, nombre = texto(codigo, "Código"), texto(nombre, "Nombre")
+    carrera, docente = texto(carrera, "Carrera"), texto(docente, "Docente")
+    try:
+        cupo = int(cupo)
+        if cupo <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ErrorNegocio("El cupo debe ser un número entero mayor que 0.")
+    if codigo in BD["materias"]:
+        raise ErrorNegocio("Ya existe una materia con ese código.")
+    d = BD["usuarios"].get(docente)
+    if not d or d["rol"] != "DOCENTE" or not d["activo"]:
+        raise ErrorNegocio("El docente elegido no existe o no está activo.")
+    BD["materias"][codigo] = {"codigo": codigo, "nombre": nombre, "carrera": carrera,
+                              "docente": docente, "cupo": cupo}
+    guardar("materias")
+
+
+def baja_materia(actor, codigo):
+    requiere(actor, "materias")
+    if codigo not in BD["materias"]:
+        raise ErrorNegocio("La materia no existe.")
+    del BD["materias"][codigo]
+    BD["inscripciones"][:] = [i for i in BD["inscripciones"] if i["materia"] != codigo]
+    guardar("materias", "inscripciones")
+
+
+def inscribir(actor, codigo):
+    requiere(actor, "inscribirse")
+    m = BD["materias"].get(codigo)
+    if not m:
+        raise ErrorNegocio("Elegí una materia.")
+    vigentes = [i for i in BD["inscripciones"] if i["materia"] == codigo and i["estado"] != "Cancelada"]
+    if any(i["alumno"] == actor["dni"] for i in vigentes):
+        raise ErrorNegocio("Ya tenés una inscripción vigente en esa materia.")
+    if len(vigentes) >= m["cupo"]:
+        raise ErrorNegocio("La materia no tiene cupo disponible.")
+    nuevo = max((i["id"] for i in BD["inscripciones"]), default=0) + 1
+    BD["inscripciones"].append({"id": nuevo, "alumno": actor["dni"], "materia": codigo, "estado": "Pendiente"})
+    guardar("inscripciones")
+
+
+def cambiar_estado(actor, id_insc, estado):
+    """Docente: Aprobada/Cancelada en SUS materias. Alumno: solo cancelar las propias."""
+    ins = next((i for i in BD["inscripciones"] if i["id"] == id_insc), None)
+    if not ins:
+        raise ErrorNegocio("La inscripción no existe.")
+    if ins["estado"] != "Pendiente":
+        raise ErrorNegocio("Solo se pueden modificar inscripciones pendientes.")
+    if puede(actor, "calificar"):
+        if BD["materias"].get(ins["materia"], {}).get("docente") != actor["dni"]:
+            raise ErrorNegocio("Esa inscripción no es de una materia tuya.")
+    else:
+        requiere(actor, "cancelar")
+        if ins["alumno"] != actor["dni"] or estado != "Cancelada":
+            raise ErrorNegocio("Solo podés cancelar tus propias inscripciones.")
+    ins["estado"] = estado
+    guardar("inscripciones")
+
+
+def listar_inscripciones(actor):
+    if puede(actor, "ver_todas"):
+        return list(BD["inscripciones"])
+    if puede(actor, "calificar"):
+        return [i for i in BD["inscripciones"] if BD["materias"].get(i["materia"], {}).get("docente") == actor["dni"]]
+    return [i for i in BD["inscripciones"] if i["alumno"] == actor["dni"]]
+
+
+def matriz_reporte(actor):
+    """Matriz materias x estados, armada con bucles anidados desde los datos reales."""
+    requiere(actor, "reportes")
+    materias = [m for m in BD["materias"].values() if puede(actor, "ver_todas") or m["docente"] == actor["dni"]]
+    matriz = [[0 for _ in ESTADOS] for _ in materias]
+    for f, m in enumerate(materias):
+        for ins in BD["inscripciones"]:
+            if ins["materia"] == m["codigo"] and ins["estado"] in ESTADOS:
+                matriz[f][ESTADOS.index(ins["estado"])] += 1
+    return materias, matriz
+
+
+# ===================== INTERFAZ =====================
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import messagebox, ttk
+
+TEMAS = {
+    "claro": {"bg": "#f3f3f3", "fg": "#1a1a1a", "campo": "#ffffff", "boton": "#e1e1e1", "sel": "#bcdcf5"},
+    "oscuro": {"bg": "#1e1e1e", "fg": "#e6e6e6", "campo": "#2b2b2b", "boton": "#3a3a3a", "sel": "#0e639c"},
+}
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Gestión Académica - Facultad")
+        self.geometry("920x580")
+        self.minsize(780, 480)
+        self.tema, self.tam, self.usuario, self.trees = "claro", 11, None, {}
+        self.style = ttk.Style(self)
+        self.style.theme_use("clam")
+        barra = ttk.Frame(self, padding=(10, 6))
+        barra.pack(fill="x")
+        self.lbl_usuario = ttk.Label(barra, text="Sin sesión")
+        self.lbl_usuario.pack(side="left")
+        self.btn_salir = ttk.Button(barra, text="Cerrar sesión", command=self.login_pantalla, state="disabled")
+        self.btn_salir.pack(side="right")
+        ttk.Button(barra, text="A+", width=4, command=lambda: self.cambiar_tam(1)).pack(side="right", padx=2)
+        ttk.Button(barra, text="A-", width=4, command=lambda: self.cambiar_tam(-1)).pack(side="right", padx=2)
+        ttk.Button(barra, text="Claro/Oscuro", command=self.cambiar_tema).pack(side="right", padx=6)
+        self.contenido = ttk.Frame(self, padding=10)
+        self.contenido.pack(fill="both", expand=True)
+        self.estilo()
+        for aviso in AVISOS:
+            messagebox.showwarning("Aviso", aviso)
+        self.login_pantalla()
+
+    # ---------- apariencia ----------
+    def estilo(self):
+        c, st = TEMAS[self.tema], self.style
+        for n in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont"):
+            tkfont.nametofont(n).configure(size=self.tam)
+        self.configure(bg=c["bg"])
+        st.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["campo"])
+        st.configure("TButton", background=c["boton"], padding=5)
+        st.map("TButton", background=[("active", c["sel"]), ("disabled", c["bg"])])
+        st.configure("TEntry", insertcolor=c["fg"])
+        st.configure("TCombobox", background=c["boton"], arrowcolor=c["fg"])
+        st.map("TCombobox", fieldbackground=[("readonly", c["campo"])], foreground=[("readonly", c["fg"])])
+        st.configure("Treeview", background=c["campo"], rowheight=int(self.tam * 2.2))
+        st.map("Treeview", background=[("selected", c["sel"])], foreground=[("selected", c["fg"])])
+        st.configure("Treeview.Heading", background=c["boton"])
+        st.configure("TNotebook.Tab", background=c["boton"], padding=(12, 5))
+        st.map("TNotebook.Tab", background=[("selected", c["sel"])])
+        for opcion, valor in (("background", c["campo"]), ("foreground", c["fg"]),
+                              ("selectBackground", c["sel"]), ("selectForeground", c["fg"])):
+            self.option_add(f"*TCombobox*Listbox.{opcion}", valor)
+
+    def cambiar_tema(self):
+        self.tema = "oscuro" if self.tema == "claro" else "claro"
+        self.estilo()
+
+    def cambiar_tam(self, delta):
+        self.tam = max(8, min(22, self.tam + delta))
+        self.estilo()
+
+    # ---------- utilidades ----------
+    def ejecutar(self, funcion, *args):
+        """Corre una acción sin que un error cierre el programa."""
+        try:
+            funcion(self.usuario, *args)
+        except (ErrorNegocio, PermissionError) as e:
+            messagebox.showwarning("Aviso", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Error inesperado", str(e))
+            return
+        self.refrescar()
+
+    def tabla(self, padre, columnas):
+        marco = ttk.Frame(padre)
+        marco.pack(fill="both", expand=True, pady=(8, 0))
+        tree = ttk.Treeview(marco, columns=columnas, show="headings", selectmode="browse")
+        for col in columnas:
+            tree.heading(col, text=col)
+            tree.column(col, width=120)
+        scroll = ttk.Scrollbar(marco, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        return tree
+
+    def seleccion(self, nombre):
+        sel = self.trees[nombre].selection()
+        if not sel:
+            messagebox.showinfo("Aviso", "Seleccioná una fila de la tabla primero.")
+            return None
+        return sel[0]  # el iid es la clave (dni, código o id)
+
+    def entradas(self, padre, campos):
+        """Crea etiqueta + entrada por cada (texto, ancho, oculto); devuelve las variables."""
+        vars_ = []
+        for texto_, ancho, oculto in campos:
+            ttk.Label(padre, text=texto_).pack(side="left", padx=(0, 4))
+            v = tk.StringVar()
+            ttk.Entry(padre, textvariable=v, width=ancho, show="*" if oculto else "").pack(side="left", padx=(0, 10))
+            vars_.append(v)
+        return vars_
+
+    def boton(self, padre, texto_, comando):
+        ttk.Button(padre, text=texto_, command=comando).pack(side="left", padx=(0, 6))
+
+    def accion_fila(self, nombre, funcion, *extra):
+        clave = self.seleccion(nombre)
+        if clave:
+            self.ejecutar(funcion, clave, *extra)
+
+    # ---------- login ----------
+    def login_pantalla(self):
+        self.usuario = None
+        self.lbl_usuario.config(text="Sin sesión")
+        self.btn_salir.config(state="disabled")
+        self.limpiar()
+        caja = ttk.Frame(self.contenido)
+        caja.place(relx=0.5, rely=0.4, anchor="center")
+        ttk.Label(caja, text="Iniciar sesión", font=("TkDefaultFont", self.tam + 6, "bold")).grid(columnspan=2, pady=10)
+        self.v_dni, self.v_clave = tk.StringVar(), tk.StringVar()
+        ttk.Label(caja, text="DNI / usuario").grid(row=1, column=0, sticky="e", pady=4)
+        e = ttk.Entry(caja, textvariable=self.v_dni)
+        e.grid(row=1, column=1, padx=6)
+        ttk.Label(caja, text="Contraseña").grid(row=2, column=0, sticky="e", pady=4)
+        ttk.Entry(caja, textvariable=self.v_clave, show="*").grid(row=2, column=1, padx=6)
+        ttk.Button(caja, text="Ingresar", command=self.entrar).grid(columnspan=2, pady=12)
+        ttk.Label(caja, text="Primer ingreso: admin / admin123").grid(columnspan=2)
+        e.focus()
+        self.bind("<Return>", lambda _e: self.entrar() if self.usuario is None else None)
+
+    def limpiar(self):
+        for w in self.contenido.winfo_children():
+            w.destroy()
+        self.trees = {}
+
+    def entrar(self):
+        try:
+            self.usuario = login(self.v_dni.get(), self.v_clave.get())
+        except ErrorNegocio as e:
+            messagebox.showwarning("Aviso", str(e))
+            return
+        self.lbl_usuario.config(text=f"{self.usuario['nombre']} ({self.usuario['rol']})")
+        self.btn_salir.config(state="normal")
+        self.principal()
+
+    # ---------- pantalla principal: pestañas según rol ----------
+    def principal(self):
+        self.limpiar()
+        nb = ttk.Notebook(self.contenido)
+        nb.pack(fill="both", expand=True)
+        u = self.usuario
+        if puede(u, "usuarios"):
+            nb.add(self.tab_usuarios(nb), text="Usuarios")
+        if puede(u, "materias"):
+            nb.add(self.tab_materias(nb), text="Materias")
+        nb.add(self.tab_inscripciones(nb), text="Inscripciones")
+        if puede(u, "reportes"):
+            nb.add(self.tab_reporte(nb), text="Reporte")
+        self.refrescar()
+
+    def tab_usuarios(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        fila = ttk.Frame(f)
+        fila.pack(fill="x")
+        dni, nom, clave = self.entradas(fila, [("DNI", 12, False), ("Nombre", 16, False), ("Clave", 10, True)])
+        rol = tk.StringVar(value="ALUMNO")
+        ttk.Combobox(fila, textvariable=rol, values=ROLES, state="readonly", width=10).pack(side="left")
+        fila2 = ttk.Frame(f)
+        fila2.pack(fill="x", pady=(8, 0))
+        self.boton(fila2, "Agregar", lambda: self.ejecutar(alta_usuario, dni.get(), nom.get(), rol.get(), clave.get()))
+        self.boton(fila2, "Activar/Desactivar", lambda: self.accion_fila("usuarios", alternar_usuario))
+        self.boton(fila2, "Eliminar", lambda: self.confirmar("usuarios", baja_usuario))
+        self.trees["usuarios"] = self.tabla(f, ("DNI", "Nombre", "Rol", "Activo"))
+        return f
+
+    def confirmar(self, nombre, funcion):
+        clave = self.seleccion(nombre)
+        if clave and messagebox.askyesno("Confirmar", f"¿Eliminar '{clave}'?"):
+            self.ejecutar(funcion, clave)
+
+    def tab_materias(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        fila = ttk.Frame(f)
+        fila.pack(fill="x")
+        cod, nom, car, cupo = self.entradas(fila, [("Código", 8, False), ("Nombre", 16, False),
+                                                    ("Carrera", 12, False), ("Cupo", 5, False)])
+        fila2 = ttk.Frame(f)
+        fila2.pack(fill="x", pady=(8, 0))
+        ttk.Label(fila2, text="Docente").pack(side="left", padx=(0, 4))
+        doc = tk.StringVar()
+        self.cb_docente = ttk.Combobox(fila2, textvariable=doc, state="readonly", width=28)
+        self.cb_docente.pack(side="left", padx=(0, 10))
+        self.boton(fila2, "Agregar", lambda: self.ejecutar(
+            alta_materia, cod.get(), nom.get(), car.get(), doc.get().split(" - ")[0], cupo.get()))
+        self.boton(fila2, "Eliminar", lambda: self.confirmar("materias", baja_materia))
+        self.trees["materias"] = self.tabla(f, ("Código", "Nombre", "Carrera", "Docente", "Cupo"))
+        return f
+
+    def tab_inscripciones(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        fila = ttk.Frame(f)
+        fila.pack(fill="x")
+        u = self.usuario
+        self.cb_materia = None
+        if puede(u, "inscribirse"):
+            mat = tk.StringVar()
+            self.cb_materia = ttk.Combobox(fila, textvariable=mat, state="readonly", width=34)
+            self.cb_materia.pack(side="left", padx=(0, 6))
+            self.boton(fila, "Inscribirme", lambda: self.ejecutar(inscribir, mat.get().split(" - ")[0]))
+        if puede(u, "cancelar"):
+            self.boton(fila, "Cancelar seleccionada", lambda: self.estado_fila("Cancelada"))
+        if puede(u, "calificar"):
+            self.boton(fila, "Aprobar", lambda: self.estado_fila("Aprobada"))
+            self.boton(fila, "Cancelar", lambda: self.estado_fila("Cancelada"))
+        self.trees["inscripciones"] = self.tabla(f, ("ID", "Alumno", "Materia", "Estado"))
+        return f
+
+    def estado_fila(self, estado):
+        clave = self.seleccion("inscripciones")
+        if clave:
+            self.ejecutar(cambiar_estado, int(clave), estado)
+
+    def tab_reporte(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        ttk.Label(f, text="Inscripciones por materia y estado").pack(anchor="w")
+        self.trees["reporte"] = self.tabla(f, ("Materia", *ESTADOS, "Total"))
+        return f
+
+    # ---------- refrescar tablas ----------
+    def refrescar(self):
+        if self.usuario is None:
+            return
+        try:
+            for tree in self.trees.values():
+                tree.delete(*tree.get_children())
+            nombre = lambda dni: BD["usuarios"].get(dni, {}).get("nombre", dni)
+            if "usuarios" in self.trees:
+                for u in BD["usuarios"].values():
+                    self.trees["usuarios"].insert("", "end", iid=u["dni"], values=(
+                        u["dni"], u["nombre"], u["rol"], "Sí" if u["activo"] else "No"))
+            if "materias" in self.trees:
+                for m in BD["materias"].values():
+                    self.trees["materias"].insert("", "end", iid=m["codigo"], values=(
+                        m["codigo"], m["nombre"], m["carrera"], nombre(m["docente"]), m["cupo"]))
+                self.cb_docente["values"] = [f"{d['dni']} - {d['nombre']}" for d in BD["usuarios"].values()
+                                             if d["rol"] == "DOCENTE" and d["activo"]]
+            if self.cb_materia is not None:
+                self.cb_materia["values"] = [f"{m['codigo']} - {m['nombre']}" for m in BD["materias"].values()]
+            for i in listar_inscripciones(self.usuario):
+                self.trees["inscripciones"].insert("", "end", iid=str(i["id"]), values=(
+                    i["id"], nombre(i["alumno"]), BD["materias"].get(i["materia"], {}).get("nombre", i["materia"]),
+                    i["estado"]))
+            if "reporte" in self.trees:
+                materias, matriz = matriz_reporte(self.usuario)
+                totales = [0] * len(ESTADOS)
+                for f, m in enumerate(materias):
+                    for c, valor in enumerate(matriz[f]):
+                        totales[c] += valor
+                    self.trees["reporte"].insert("", "end", values=(m["nombre"], *matriz[f], sum(matriz[f])))
+                self.trees["reporte"].insert("", "end", values=("TOTAL", *totales, sum(totales)))
+        except Exception as e:
+            messagebox.showerror("Error al actualizar", str(e))
+
+
+if __name__ == "__main__":
+    cargar()
+    App().mainloop()
